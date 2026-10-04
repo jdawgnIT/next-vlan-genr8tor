@@ -1,0 +1,266 @@
+"use client";
+import React, { useState } from 'react';
+
+export default function NetworkGenerator() {
+  const [activeTab, setActiveTab] = useState('vlans');
+  const [globalSettings, setGlobalSettings] = useState({
+    nativeVlan: '1',
+    managementVlan: '10',
+    managementSwitchPort: 'Gi0/24'
+  });
+
+  const [vlans, setVlans] = useState([
+    { id: '10', name: 'MGMT', purpose: 'Device Management', subnet: '10.10.10.0/24', routerIp: '10.10.10.1', switchIp: '10.10.10.2', apIp: '10.10.10.3', isWireless: false, isHostile: false, ssid: '' },
+    { id: '20', name: 'GUEST_WIFI', purpose: 'Hostile Wireless Untrusted', subnet: '10.10.20.0/24', routerIp: '10.10.20.1', switchIp: 'DHCP', apIp: 'NONE', isWireless: true, isHostile: true, ssid: 'Hostile_Guest' }
+  ]);
+
+  const [expandedCard, setExpandedCard] = useState(null);
+
+  const addVlan = () => {
+    const newId = String(Math.max(...vlans.map(v => parseInt(v.id || 0))) + 10);
+    setVlans([...vlans, {
+      id: newId,
+      name: `VLAN_${newId}`,
+      purpose: 'Internet Only Wireless',
+      subnet: `10.10.${newId}.0/24`,
+      routerIp: `10.10.${newId}.1`,
+      switchIp: 'NONE',
+      apIp: 'NONE',
+      isWireless: true,
+      isHostile: true,
+      ssid: `Secure_Wifi_${newId}`
+    }]);
+    setExpandedCard(newId);
+  };
+
+  const updateVlan = (id, field, value) => {
+    setVlans(vlans.map(v => v.id === id ? { ...v, [field]: value } : v));
+  };
+
+  const removeVlan = (id) => {
+    setVlans(vlans.filter(v => v.id !== id));
+  };
+
+  // --- CONFIG GENERATION LOGIC ---
+  
+  const generateCiscoSwitch = () => {
+    let conf = `! --- CISCO IOS SWITCH CONFIGURATION ---\n`;
+    conf += `vlan dot1q tag native\n!\n`;
+    
+    vlans.forEach(v => {
+      conf += `vlan ${v.id}\n name ${v.name}\n`;
+    });
+    
+    conf += `!\n! Management SVI (Static Wired Access Only)\n`;
+    const mgmt = vlans.find(v => v.id === globalSettings.managementVlan);
+    if (mgmt) {
+      conf += `interface Vlan${mgmt.id}\n description Management_Interface\n ip address ${mgmt.switchIp} 255.255.255.0\n no shut\n!\n`;
+    }
+
+    conf += `! Physical Port to Management Device Access\n`;
+    conf += `interface ${globalSettings.managementSwitchPort}\n description Wired_Admin_Access_Port\n switchport mode access\n switchport access vlan ${globalSettings.managementVlan}\n spanning-tree portfast\n!\n`;
+
+    conf += `! Trunk Port to pfSense Router\n`;
+    conf += `interface Gi0/1\n description Trunk_to_pfSense\n switchport trunk encapsulation dot1q\n switchport trunk native vlan ${globalSettings.nativeVlan}\n switchport mode trunk\n!\n`;
+
+    conf += `! Trunk Port to Autonomous AP\n`;
+    conf += `interface Gi0/2\n description Trunk_to_Autonomous_AP\n switchport trunk encapsulation dot1q\n switchport trunk native vlan ${globalSettings.nativeVlan}\n switchport mode trunk\n`;
+    return conf;
+  };
+
+  const generateCiscoAP = () => {
+    let conf = `! --- CISCO AUTONOMOUS AP CONFIGURATION ---\n`;
+    conf += `vlan dot1q tag native\n!\n`;
+
+    const mgmt = vlans.find(v => v.id === globalSettings.managementVlan);
+    if (mgmt) {
+      conf += `! Management Interface BVI\n`;
+      conf += `interface BVI1\n ip address ${mgmt.apIp} 255.255.255.0\n no shut\n!\n`;
+    }
+
+    const wirelessVlans = vlans.filter(v => v.isWireless && v.isHostile);
+    
+    wirelessVlans.forEach(v => {
+      conf += `dot11 ssid ${v.ssid}\n   vlan ${v.id}\n   authentication open\n   authentication key-management wpa version 2\n   wpa-psk ascii 0 YourSecurePassphrase\n`;
+      conf += `   ! Public Secure Packet Forwarding (Client Isolation)\n   station-role root public-secure-packet\n!\n`;
+    });
+
+    conf += `! Radio Interface Mapping\ninterface Dot11Radio0\n encryption vlan ${globalSettings.nativeVlan} mode ciphers aes-ccm\n`;
+    wirelessVlans.forEach(v => {
+      conf += ` encryption vlan ${v.id} mode ciphers aes-ccm\n`;
+    });
+    wirelessVlans.forEach(v => {
+      conf += ` ssid ${v.ssid}\n`;
+    });
+    conf += ` no shut\n!\n`;
+
+    // Sub-interfaces bridging
+    wirelessVlans.forEach(v => {
+      conf += `interface Dot11Radio0.${v.id}\n encapsulation dot1Q ${v.id}\n bridge-group ${v.id}\n subscriber-loop-control\n!\n`;
+      conf += `interface GigabitEthernet0.${v.id}\n encapsulation dot1Q ${v.id}\n bridge-group ${v.id}\n!\n`;
+    });
+
+    return conf;
+  };
+
+  const generatePfSense = () => {
+    let xml = `<!-- pfSense XML Fragment Fragment for /conf/config.xml -->\n<vlans>\n`;
+    vlans.forEach(v => {
+      xml += `  <vlan>\n    <if>igb1</if>\n    <tag>${v.id}</tag>\n    <descr>${v.name}</descr>\n  </vlan>\n`;
+    });
+    xml += `</vlans>\n\n# Shell commands (Easyrule Layer) for Hostile Isolation:\n`;
+    vlans.filter(v => v.isHostile).forEach(v => {
+      xml += `# Block traffic from hostile VLAN ${v.name} to management net\n`;
+      xml += `easyrule block igb1_vlan${v.id} any any 10.10.10.0/24\n`;
+    });
+    return xml;
+  };
+
+  const generateMermaid = () => {
+    let diagram = `graph TD\n`;
+    diagram += `  Internet((WAN / Internet)) --> pfSense[pfSense Router]\n`;
+    diagram += `  pfSense -->|Trunk: Tagged Native + Data Tagged| Switch[Cisco Switch]\n`;
+    
+    const mgmt = vlans.find(v => v.id === globalSettings.managementVlan);
+    if(mgmt) {
+      diagram += `  Switch -->|Access Port: VLAN ${mgmt.id}| Admin[Admin PC / Wired Management Only]\n`;
+    }
+    
+    diagram += `  Switch -->|Trunk: Tagged Native + Data Tagged| AP[Autonomous AP]\n`;
+    
+    vlans.filter(v => v.isWireless).forEach(v => {
+      diagram += `  AP -.->|SSID: ${v.ssid} PSP Isolated| Client_${v.id}[Device on ${v.name}]\n`;
+      if(v.isHostile) {
+        diagram += `  style Client_${v.id} fill:#f9f,stroke:#333,stroke-width:2px\n`;
+      }
+    });
+    return diagram;
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-6 font-sans">
+      <div className="max-w-6xl mx-auto space-y-6">
+        <header className="border-b border-slate-700 pb-4">
+          <h1 className="text-3xl font-extrabold tracking-tight text-emerald-400">Isolated Network Script Bootstrap Engine</h1>
+          <p className="text-sm text-slate-400 mt-1">WSL Environment Context // Debian Native execution targeting Cisco IOS &amp; pfSense Stack</p>
+        </header>
+
+        {/* Global Config Segment */}
+        <section className="bg-slate-800 p-4 rounded-xl border border-slate-700 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs font-bold text-slate-400 uppercase">Global Native VLAN (Tagged Trunk)</label>
+            <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-2 text-white" value={globalSettings.nativeVlan} onChange={e => setGlobalSettings({...globalSettings, nativeVlan: e.target.value})} />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-400 uppercase">Management VLAN</label>
+            <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-2 text-white" value={globalSettings.managementVlan} onChange={e => setGlobalSettings({...globalSettings, managementVlan: e.target.value})} />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-400 uppercase">Wired Admin Switch Port</label>
+            <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-2 text-white" value={globalSettings.managementSwitchPort} onChange={e => setGlobalSettings({...globalSettings, managementSwitchPort: e.target.value})} />
+          </div>
+        </section>
+
+        {/* Operational Nav Tabs */}
+        <div className="flex border-b border-slate-700 space-x-2">
+          <button onClick={() => setActiveTab('vlans')} className={`px-4 py-2 font-medium text-sm rounded-t-lg transition ${activeTab === 'vlans' ? 'bg-slate-800 text-emerald-400 border-t-2 border-emerald-400' : 'text-slate-400 hover:text-white'}`}>VLAN Matrix &amp; Topology Map</button>
+          <button onClick={() => setActiveTab('scripts')} className={`px-4 py-2 font-medium text-sm rounded-t-lg transition ${activeTab === 'scripts' ? 'bg-slate-800 text-emerald-400 border-t-2 border-emerald-400' : 'text-slate-400 hover:text-white'}`}>Generated Configurations</button>
+        </div>
+
+        {/* Tab 1: VLAN Designer */}
+        {activeTab === 'vlans' && (
+          <div className="space-y-4">
+            <div className="flex justify-between items-center">
+              <h2 className="text-xl font-bold">Configured Segment Arrays</h2>
+              <button onClick={addVlan} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-4 rounded text-sm transition">+ Add Segment Profile</button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3">
+              {vlans.map(v => (
+                <div key={v.id} className="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden">
+                  <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-slate-750" onClick={() => setExpandedCard(expandedCard === v.id ? null : v.id)}>
+                    <div className="flex items-center space-x-4">
+                      <span className="bg-slate-900 px-3 py-1 rounded text-emerald-400 font-mono font-bold">TAG {v.id}</span>
+                      <div>
+                        <h4 className="font-bold text-md">{v.name}</h4>
+                        <p className="text-xs text-slate-400">{v.purpose}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-3">
+                      {v.isHostile && <span className="bg-red-950 text-red-400 border border-red-800 text-[10px] px-2 py-0.5 rounded-full font-bold">HOSTILE ZONE</span>}
+                      {v.isWireless && <span className="bg-blue-950 text-blue-400 border border-blue-800 text-[10px] px-2 py-0.5 rounded-full font-bold">WIRELESS</span>}
+                      <span className="text-slate-500 text-xs font-mono">{v.subnet}</span>
+                      <span className="text-slate-400 text-lg">{expandedCard === v.id ? '▼' : '►'}</span>
+                    </div>
+                  </div>
+
+                  {expandedCard === v.id && (
+                    <div className="p-4 border-t border-slate-700 bg-slate-850 grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <label className="block text-xs font-bold text-slate-400">VLAN ID Tag</label>
+                        <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-1.5 text-xs font-mono" value={v.id} onChange={e => updateVlan(v.id, 'id', e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-slate-400">Segment Name</label>
+                        <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-1.5 text-xs font-mono" value={v.name} onChange={e => updateVlan(v.id, 'name', e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-slate-400">Subnet Scope</label>
+                        <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-1.5 text-xs font-mono" value={v.subnet} onChange={e => updateVlan(v.id, 'subnet', e.target.value)} />
+                      </div>
+                      <div className="flex items-center space-x-6 py-2">
+                        <label className="flex items-center space-x-2 text-xs font-bold text-slate-300">
+                          <input type="checkbox" checked={v.isWireless} onChange={e => updateVlan(v.id, 'isWireless', e.target.checked)} className="rounded bg-slate-700 border-slate-600" />
+                          <span>Wireless Segment</span>
+                        </label>
+                        <label className="flex items-center space-x-2 text-xs font-bold text-slate-300">
+                          <input type="checkbox" checked={v.isHostile} onChange={e => updateVlan(v.id, 'isHostile', e.target.checked)} className="rounded bg-slate-700 border-slate-600" />
+                          <span>Hostile / Internet Only</span>
+                        </label>
+                      </div>
+                      {v.isWireless && (
+                        <div>
+                          <label className="block text-xs font-bold text-slate-400">Target SSID Name</label>
+                          <input type="text" className="mt-1 w-full bg-slate-700 border border-slate-600 rounded p-1.5 text-xs font-mono" value={v.ssid} onChange={e => updateVlan(v.id, 'ssid', e.target.value)} />
+                        </div>
+                      )}
+                      <div className="md:col-span-3 flex justify-end">
+                        <button onClick={() => removeVlan(v.id)} className="text-xs bg-red-900/40 border border-red-700 text-red-300 px-3 py-1 rounded hover:bg-red-800/50 transition">Delete Profile</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Tab 2: Scripts Engine output */}
+        {activeTab === 'scripts' && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <h3 className="text-md font-bold text-emerald-400">Cisco IOS L2 Switch Engine</h3>
+                <pre className="bg-slate-950 p-4 rounded-xl text-xs font-mono overflow-x-auto text-slate-300 border border-slate-800 max-h-96">{generateCiscoSwitch()}</pre>
+              </div>
+              <div className="space-y-4">
+                <h3 className="text-md font-bold text-cyan-400">Cisco Autonomous AP Engine (Hostile Targets Only)</h3>
+                <pre className="bg-slate-950 p-4 rounded-xl text-xs font-mono overflow-x-auto text-slate-300 border border-slate-800 max-h-96">{generateCiscoAP()}</pre>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <h3 className="text-md font-bold text-orange-400">pfSense XML Interoperability Block</h3>
+              <pre className="bg-slate-950 p-4 rounded-xl text-xs font-mono overflow-x-auto text-slate-300 border border-slate-800 max-h-64">{generatePfSense()}</pre>
+            </div>
+
+            <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-2">
+              <h3 className="text-sm font-bold tracking-wider uppercase text-slate-400">Computed Topology Blueprint String (Paste into Mermaid Live)</h3>
+              <pre className="text-xs font-mono bg-slate-900 p-3 rounded border border-slate-700 text-slate-400">{generateMermaid()}</pre>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
